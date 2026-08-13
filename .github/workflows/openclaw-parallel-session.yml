@@ -1,0 +1,736 @@
+name: OpenClaw Parallel Session
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Session identifier (auto-generated for chains)'
+        required: false
+        default: ''
+      chain_count:
+        description: 'Chain iteration counter'
+        required: false
+        default: '0'
+      openclaw_cache_version:
+        description: 'Bump to force openclaw upgrade (e.g. v1 -> v2)'
+        required: false
+        default: 'v1'
+  repository_dispatch:
+    types: [chain-openclaw-parallel]
+
+env:
+  CHAIN_TRIGGER_MINUTES: 345
+  SAVE_INTERVAL_MINUTES: 60
+  OPENCLAW_PORT: 18789
+
+jobs:
+  openclaw-session:
+    name: OpenClaw (${{ matrix.bot.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        bot:
+          - id: "bot1"
+            name: "Bot 1 (@anugclawd_bot)"
+            token_secret: "TELEGRAM_BOT_TOKEN_1"
+            model_key_secret: "NVIDIA_API_KEY_1"
+            config_secret: "OPENCLAW_CONFIG_1"
+            auth_secret: "OPENCLAW_AUTH_PROFILES_1"
+            artifact_name: "openclaw-workspace-bot1"
+          - id: "bot2"
+            name: "Bot 2 (@second_bot)"
+            token_secret: "TELEGRAM_BOT_TOKEN_2"
+            model_key_secret: "NVIDIA_API_KEY_2"
+            config_secret: "OPENCLAW_CONFIG_2"
+            auth_secret: "OPENCLAW_AUTH_PROFILES_2"
+            artifact_name: "openclaw-workspace-bot2"
+
+    concurrency:
+      group: openclaw-parallel-${{ matrix.bot.id }}
+      cancel-in-progress: false
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Generate session info
+        id: session
+        run: |
+          SESSION_ID="${{ github.event.inputs.session_id }}"
+          if [ -z "$SESSION_ID" ]; then
+            SESSION_ID=$(uuidgen | cut -c1-8)
+          fi
+
+          CHAIN_COUNT="${{ github.event.inputs.chain_count }}"
+          if [ -z "$CHAIN_COUNT" ]; then
+            CHAIN_COUNT=0
+          fi
+
+          OPENCLAW_CACHE_VERSION="${{ github.event.inputs.openclaw_cache_version }}"
+
+          # Handle repository_dispatch payload
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            PAYLOAD_COUNT="${{ github.event.client_payload.chain_count }}"
+            if [ -n "$PAYLOAD_COUNT" ]; then
+              CHAIN_COUNT="$PAYLOAD_COUNT"
+            fi
+            PAYLOAD_CACHE="${{ github.event.client_payload.openclaw_cache_version }}"
+            if [ -n "$PAYLOAD_CACHE" ]; then
+              OPENCLAW_CACHE_VERSION="$PAYLOAD_CACHE"
+            fi
+          fi
+
+          if [ -z "$OPENCLAW_CACHE_VERSION" ]; then
+            OPENCLAW_CACHE_VERSION="v1"
+          fi
+
+          JOB_START=$(date +%s)
+
+          echo "SESSION_ID=$SESSION_ID" >> "$GITHUB_OUTPUT"
+          echo "CHAIN_COUNT=$CHAIN_COUNT" >> "$GITHUB_OUTPUT"
+          echo "OPENCLAW_CACHE_VERSION=$OPENCLAW_CACHE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "JOB_START=$JOB_START" >> "$GITHUB_OUTPUT"
+
+          echo "Session: $SESSION_ID | Chain: $CHAIN_COUNT | Cache: $OPENCLAW_CACHE_VERSION | Bot: ${{ matrix.bot.name }}"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # ========== CACHING ==========
+      - name: Restore npm global packages cache
+        id: cache-npm-global
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.npm-global
+          key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
+
+      - name: Restore CloakBrowser cache
+        id: cache-cloakbrowser
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cloakbrowser
+            ~/.cache/cloakbrowser-node
+            ~/.npm
+          key: cloakbrowser-v4-${{ runner.os }}
+          restore-keys: |
+            cloakbrowser-v4-${{ runner.os }}
+
+      # ========== OPENCLAW SETUP ==========
+      - name: Install OpenClaw
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          CACHE_WORKING=false
+          if [ "${{ steps.cache-npm-global.outputs.cache-hit }}" = "true" ]; then
+            if command -v openclaw &>/dev/null; then
+              VER=$(openclaw --version 2>&1) && CACHE_WORKING=true
+              echo "OpenClaw restored from cache: $VER"
+            else
+              echo "WARNING: Cache hit but openclaw binary not found"
+            fi
+          else
+            echo "No npm cache hit (version: ${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }})"
+          fi
+
+          if [ "$CACHE_WORKING" = "false" ]; then
+            echo "Installing openclaw@latest fresh..."
+            npm install -g openclaw@latest
+          fi
+
+      - name: Install CloakBrowser for browser control
+        run: |
+          export CLOAKBROWSER_CACHE_DIR="$HOME/.cloakbrowser"
+          export CLOAKBROWSER_NODE_DIR="$HOME/.cache/cloakbrowser-node"
+      
+          mkdir -p "$CLOAKBROWSER_CACHE_DIR"
+          mkdir -p "$CLOAKBROWSER_NODE_DIR"
+      
+          cd "$CLOAKBROWSER_NODE_DIR"
+      
+          if [ ! -f package.json ]; then
+            cat > package.json <<'JSON'
+          {
+            "name": "cloakbrowser-ci-cache",
+            "version": "1.0.0",
+            "private": true,
+            "type": "module"
+          }
+          JSON
+          fi
+      
+          if [ ! -f "$CLOAKBROWSER_NODE_DIR/node_modules/cloakbrowser/package.json" ]; then
+            echo "Installing CloakBrowser npm package..."
+            npm install cloakbrowser playwright-core
+          else
+            echo "CloakBrowser npm package already present cached"
+          fi
+      
+          npx playwright install-deps chromium 2>/dev/null || true
+          npx playwright install chromium 2>/dev/null || true
+      
+          node --input-type=module - <<'NODE' || true
+          import { ensureBinary, binaryInfo } from 'cloakbrowser';
+      
+          try {
+            await ensureBinary();
+            console.log('CloakBrowser binary ready');
+            console.log(binaryInfo());
+          } catch (err) {
+            console.warn('WARNING: CloakBrowser binary download failed (non-critical, gateway will fallback):', err.message || err);
+          }
+          NODE
+      
+          echo "CloakBrowser step completed (with fallbacks if CDN unavailable)"
+      
+          echo "CloakBrowser ready at: $CLOAKBROWSER_CACHE_DIR"
+
+      # ========== CONFIGURE ==========
+      - name: Configure OpenClaw
+        env:
+          OPENCLAW_CONFIG: ${{ secrets[matrix.bot.config_secret] || secrets.OPENCLAW_CONFIG }}
+          OPENCLAW_AUTH_PROFILES: ${{ secrets[matrix.bot.auth_secret] || secrets.OPENCLAW_AUTH_PROFILES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets[matrix.bot.token_secret] || secrets.TELEGRAM_BOT_TOKEN }}
+          NVIDIA_API_KEY: ${{ secrets[matrix.bot.model_key_secret] || secrets.NVIDIA_API_KEY }}
+        run: |
+          OPENCLAW_DIR="$HOME/.openclaw"
+          mkdir -p "$OPENCLAW_DIR"
+          mkdir -p "$OPENCLAW_DIR/workspace"
+          mkdir -p "$OPENCLAW_DIR/agents/main/agent"
+
+          if [ -n "$OPENCLAW_CONFIG" ]; then
+            CONFIG=$(echo "$OPENCLAW_CONFIG" | sed "s|C:\\\\\\\\Users\\\\\\\\[^\\\\\"]*|$HOME|g" | sed "s|C:/Users/[^/\"]*|$HOME|g")
+            CONFIG=$(echo "$CONFIG" | sed 's|\\\\|/|g')
+            echo "$CONFIG" > "$OPENCLAW_DIR/openclaw.json"
+
+            if command -v jq >/dev/null 2>&1; then
+              tmp_cfg=$(mktemp)
+              jq 'del(.plugins.entries["google-antigravity-auth"]) | .gateway.mode = "local" | .gateway.port = 18789 | .gateway.auth.mode = "token" | .gateway.auth.token = "openclaw" | .gateway.remote.token = "openclaw"' "$OPENCLAW_DIR/openclaw.json" > "$tmp_cfg" && mv "$tmp_cfg" "$OPENCLAW_DIR/openclaw.json"
+            fi
+
+            echo "Injected openclaw.json from secret for ${{ matrix.bot.name }}"
+          else
+            echo "ERROR: No OPENCLAW_CONFIG secret found for ${{ matrix.bot.name }}"
+            exit 1
+          fi
+
+          if [ -n "$OPENCLAW_AUTH_PROFILES" ]; then
+            printf '%s\n' "$OPENCLAW_AUTH_PROFILES" > "$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+            echo "Injected auth-profiles.json from secret"
+          else
+            echo "WARNING: No OPENCLAW_AUTH_PROFILES secret found"
+          fi
+
+          echo "OpenClaw configured for ${{ matrix.bot.name }}"
+
+      - name: Find previous workspace artifact
+        id: find-artifact
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          MAX_WAIT=15
+          WAITED=0
+          while [ "$WAITED" -lt "$MAX_WAIT" ]; do
+            WORKFLOW_NAME="${{ github.workflow }}"
+            OTHER_RUNS=$(gh run list --repo "$REPO" --status in_progress --json databaseId,name -q "[.[] | select(.name == \"$WORKFLOW_NAME\" and .databaseId != $CURRENT_RUN_ID)] | length")
+            if [ "$OTHER_RUNS" -gt 0 ]; then
+              echo "Previous session still running, waiting..."
+              sleep 30
+              WAITED=$((WAITED + 1))
+            else
+              break
+            fi
+          done
+
+          ARTIFACT_NAME="${{ matrix.bot.artifact_name }}"
+          ARTIFACT_INFO=$(gh api "repos/$REPO/actions/artifacts" --jq "[.artifacts[] | select(.name == \"$ARTIFACT_NAME\" and .expired == false)] | first | \"\(.id) \(.workflow_run.id)\"" 2>/dev/null || echo "")
+
+          if [ -n "$ARTIFACT_INFO" ] && [ "$ARTIFACT_INFO" != "null null" ]; then
+            RUN_ID=$(echo "$ARTIFACT_INFO" | awk '{print $2}')
+            echo "Found workspace artifact ($ARTIFACT_NAME) from run: $RUN_ID"
+            echo "RUN_ID=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "FOUND=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No previous workspace artifact ($ARTIFACT_NAME) found"
+            echo "FOUND=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore workspace from artifact
+        if: steps.find-artifact.outputs.FOUND == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          RUN_ID="${{ steps.find-artifact.outputs.RUN_ID }}"
+          WORKSPACE="$HOME/.openclaw/workspace"
+          ARTIFACT_NAME="${{ matrix.bot.artifact_name }}"
+
+          mkdir -p "$WORKSPACE"
+          echo "Downloading $ARTIFACT_NAME from run $RUN_ID..."
+          gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$WORKSPACE"
+
+          if [ -n "$(find "$WORKSPACE" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+            echo "Workspace artifact restored into $WORKSPACE"
+
+            if [ -d "$WORKSPACE/.openclaw-state/agents" ]; then
+              echo "Restoring persistent agent session history & memory state..."
+              mkdir -p "$HOME/.openclaw/agents"
+              cp -r "$WORKSPACE/.openclaw-state/agents/"* "$HOME/.openclaw/agents/" 2>/dev/null || true
+            fi
+            if [ -d "$WORKSPACE/.openclaw-state/memory" ]; then
+              mkdir -p "$HOME/.openclaw/memory"
+              cp -r "$WORKSPACE/.openclaw-state/memory/"* "$HOME/.openclaw/memory/" 2>/dev/null || true
+            fi
+          else
+            echo "WARNING: Workspace artifact download completed, but workspace is empty"
+          fi
+
+      - name: Fix OpenClaw directory permissions
+        run: |
+          chmod -R u+rwX "$HOME/.openclaw"
+          echo "Permissions fixed for ~/.openclaw"
+
+      # ========== PATCH OPENCLAW ==========
+      - name: Patch OpenClaw (Antigravity models + endpoints)
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+
+          if [ -f "./patch.sh" ]; then
+            echo "Running OpenClaw patch script..."
+            chmod +x ./patch.sh
+            bash ./patch.sh
+          else
+            echo "WARNING: patch.sh not found in repo root — skipping patching"
+          fi
+
+      # ========== TUNNEL ==========
+      - name: Start Gateway Tunnel
+        id: tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb
+
+          PORT=${{ env.OPENCLAW_PORT }}
+          TUNNEL_URL=""
+
+          echo "Attempting Cloudflare Quick Tunnel for ${{ matrix.bot.name }}..."
+          for i in 1 2 3; do
+            echo "Cloudflare attempt $i..."
+            > /tmp/tunnel.log
+            cloudflared tunnel --url http://localhost:$PORT --no-autoupdate > /tmp/tunnel.log 2>&1 &
+            TUNNEL_PID=$!
+
+            for j in $(seq 1 15); do
+              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1)
+              if [ -n "$TUNNEL_URL" ]; then break 2; fi
+              sleep 2
+            done
+
+            echo "Cloudflare attempt $i failed. Log:"
+            cat /tmp/tunnel.log
+            kill $TUNNEL_PID 2>/dev/null || true
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Cloudflare Quick Tunnels failed. Falling back to localtunnel..."
+            export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+            export PATH="$HOME/.npm-global/bin:$PATH"
+            npm install -g localtunnel
+
+            for i in 1 2 3; do
+              echo "Localtunnel attempt $i..."
+              > /tmp/tunnel.log
+              lt --port $PORT > /tmp/tunnel.log 2>&1 &
+              TUNNEL_PID=$!
+
+              for j in $(seq 1 15); do
+                TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.loca\.lt' /tmp/tunnel.log | head -1)
+                if [ -n "$TUNNEL_URL" ]; then break 2; fi
+                sleep 2
+              done
+
+              echo "Localtunnel attempt $i failed. Log:"
+              cat /tmp/tunnel.log
+              kill $TUNNEL_PID 2>/dev/null || true
+              sleep 2
+            done
+          fi
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "ERROR: All tunnel providers failed!"
+            exit 1
+          fi
+
+          echo "Tunnel established successfully: $TUNNEL_URL"
+          echo "TUNNEL_PID=$TUNNEL_PID" >> "$GITHUB_OUTPUT"
+          echo "TUNNEL_URL=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+
+      # ========== START OPENCLAW ==========
+      - name: Start OpenClaw gateway
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets[matrix.bot.token_secret] || secrets.TELEGRAM_BOT_TOKEN }}
+          NVIDIA_API_KEY: ${{ secrets[matrix.bot.model_key_secret] || secrets.NVIDIA_API_KEY }}
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+          export OPENCLAW_WORKSPACE="$HOME/.openclaw/workspace"
+          export OPENCLAW_GATEWAY_TOKEN="openclaw"
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+          PORT=${{ env.OPENCLAW_PORT }}
+
+          export PLAYWRIGHT_CHROMIUM_USE_HEADLESS_NEW=1
+
+          nohup openclaw gateway --allow-unconfigured > /tmp/openclaw.log 2>&1 &
+          OPENCLAW_PID=$!
+          echo "$OPENCLAW_PID" > /tmp/openclaw.pid
+
+          READY=false
+          for i in $(seq 1 45); do
+            if ! kill -0 "$OPENCLAW_PID" 2>/dev/null; then
+              echo "ERROR: OpenClaw gateway process exited during startup"
+              cat /tmp/openclaw.log
+              exit 1
+            fi
+
+            if curl -sS --max-time 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+              READY=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: OpenClaw gateway did not become reachable on port $PORT"
+            cat /tmp/openclaw.log
+            exit 1
+          fi
+
+          echo "OpenClaw gateway started for ${{ matrix.bot.name }} (PID: $OPENCLAW_PID, port: $PORT)"
+          echo "--- startup log ---"
+          cat /tmp/openclaw.log
+          echo "--- end startup log ---"
+
+      - name: Start OpenClaw managed browser
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets[matrix.bot.token_secret] || secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          export OPENCLAW_GATEWAY_TOKEN="openclaw"
+          export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+          GATEWAY_PORT=${{ env.OPENCLAW_PORT }}
+
+          echo "Starting OpenClaw managed browser for ${{ matrix.bot.name }}..."
+
+          if [ -f /tmp/openclaw.pid ]; then
+            OPENCLAW_PID=$(cat /tmp/openclaw.pid)
+            if ! kill -0 "$OPENCLAW_PID" 2>/dev/null; then
+              echo "Gateway process is not running anymore, restarting..."
+              export OPENCLAW_STATE_DIR="$HOME/.openclaw"
+              export OPENCLAW_WORKSPACE="$HOME/.openclaw/workspace"
+              nohup openclaw gateway --allow-unconfigured >> /tmp/openclaw.log 2>&1 &
+              OPENCLAW_PID=$!
+              echo "$OPENCLAW_PID" > /tmp/openclaw.pid
+            fi
+          fi
+
+          READY=false
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sS --max-time 2 "http://127.0.0.1:$GATEWAY_PORT/" >/dev/null 2>&1; then
+              READY=true
+              break
+            fi
+            echo "Gateway not reachable yet (attempt $i/10), waiting..."
+            sleep 3
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: Gateway is not reachable on port $GATEWAY_PORT"
+            tail -40 /tmp/openclaw.log || true
+            exit 1
+          fi
+
+          openclaw browser --browser-profile openclaw start 2>&1 || true
+          sleep 5
+
+          BROWSER_STATUS=$(openclaw browser --browser-profile openclaw status 2>&1 || echo "unknown")
+          echo "Browser status: $BROWSER_STATUS"
+
+          if curl -sf http://127.0.0.1:18800/json/version > /dev/null 2>&1; then
+            echo "Browser CDP endpoint is reachable on port 18800"
+
+            UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            curl -sf -X POST "http://127.0.0.1:$GATEWAY_PORT/browser/set/headers?profile=openclaw" \
+              -H "Authorization: Bearer openclaw" \
+              -H "Content-Type: application/json" \
+              -d "{\"headers\":{\"User-Agent\":\"$UA\"}}" 2>/dev/null && echo "Stealth: User-Agent set" || echo "WARNING: Could not set User-Agent (non-critical)"
+
+            openclaw browser --browser-profile openclaw set locale en-US 2>/dev/null || true
+            openclaw browser --browser-profile openclaw set timezone America/New_York 2>/dev/null || true
+            echo "Stealth: locale=en-US, timezone=America/New_York"
+          else
+            echo "WARNING: Browser CDP endpoint not reachable yet"
+          fi
+
+      - name: Display Connection Info
+        run: |
+          TUNNEL_URL="${{ steps.tunnel.outputs.TUNNEL_URL }}"
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          CHAIN_COUNT="${{ steps.session.outputs.CHAIN_COUNT }}"
+
+          echo ""
+          echo "=============================================="
+          echo "       OPENCLAW PARALLEL SESSION READY"
+          echo "=============================================="
+          echo "Bot Instance:  ${{ matrix.bot.name }}"
+          echo "Session ID:    $SESSION_ID"
+          echo "Chain Count:   $CHAIN_COUNT"
+          echo ""
+          echo "OpenClaw Gateway:"
+          echo "  URL:       $TUNNEL_URL"
+          echo "  Local:     http://localhost:${{ env.OPENCLAW_PORT }}"
+          echo "=============================================="
+
+      # ========== KEEPALIVE ==========
+      - name: Keep session alive
+        id: keepalive
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          JOB_START=${{ steps.session.outputs.JOB_START }}
+          CHAIN_MINUTES=${{ env.CHAIN_TRIGGER_MINUTES }}
+          HARD_LIMIT_MINUTES=350
+          SAVE_INTERVAL=${{ env.SAVE_INTERVAL_MINUTES }}
+          REPO="${{ github.repository }}"
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          CHAIN_COUNT=${{ steps.session.outputs.CHAIN_COUNT }}
+          OPENCLAW_CACHE_VERSION="${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          OPENCLAW_DIR="$HOME/.openclaw"
+
+          CHAIN_TIME=$((JOB_START + CHAIN_MINUTES * 60))
+          HARD_LIMIT=$((JOB_START + HARD_LIMIT_MINUTES * 60))
+          LAST_SAVE=$(date +%s)
+          CHAIN_TRIGGERED=false
+          BROWSER_FAIL_COUNT=0
+
+          save_secrets() {
+            CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
+            AUTH_FILE="$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+            CONFIG_SECRET="${{ matrix.bot.config_secret }}"
+            AUTH_SECRET="${{ matrix.bot.auth_secret }}"
+
+            if [ -f "$CONFIG_FILE" ] && [ -n "$CONFIG_SECRET" ]; then
+              gh secret set "$CONFIG_SECRET" --repo "$REPO" < "$CONFIG_FILE" 2>/dev/null || true
+            fi
+            if [ -f "$AUTH_FILE" ] && [ -n "$AUTH_SECRET" ]; then
+              gh secret set "$AUTH_SECRET" --repo "$REPO" < "$AUTH_FILE" 2>/dev/null || true
+            fi
+            echo "  [SAVE] Secrets ($CONFIG_SECRET) saved at $(date '+%H:%M:%S')"
+          }
+
+          trigger_chain() {
+            NEXT_CHAIN=$((CHAIN_COUNT + 1))
+            echo "  [CHAIN] Triggering next session for ${{ matrix.bot.name }} (chain: $NEXT_CHAIN)..."
+
+            BODY=$(jq -n \
+              --arg event_type "chain-openclaw-parallel" \
+              --arg session_id "$SESSION_ID" \
+              --argjson chain_count "$NEXT_CHAIN" \
+              --arg cache_version "$OPENCLAW_CACHE_VERSION" \
+              '{event_type: $event_type, client_payload: {session_id: $session_id, chain_count: $chain_count, openclaw_cache_version: $cache_version}}')
+
+            for i in 1 2 3; do
+              echo "$BODY" | gh api "repos/$REPO/dispatches" --method POST --input - && {
+                echo "  [CHAIN] Next session triggered on attempt $i"
+                return 0
+              }
+              echo "  [CHAIN] WARNING: attempt $i failed"
+              [ "$i" -lt 3 ] && sleep $((i * 10))
+            done
+            echo "  [CHAIN] ERROR: All 3 attempts failed!"
+            return 1
+          }
+
+          while [ "$(date +%s)" -lt "$HARD_LIMIT" ]; do
+            NOW=$(date +%s)
+            ELAPSED=$(( (NOW - JOB_START) / 60 ))
+
+            if [ "$CHAIN_TRIGGERED" = "false" ]; then
+              LEFT=$(( (CHAIN_TIME - NOW) / 60 ))
+              echo "[${{ matrix.bot.name }}] Session alive at $(date '+%H:%M:%S') | ${ELAPSED}min elapsed | ${LEFT}min until chain"
+            else
+              LEFT=$(( (HARD_LIMIT - NOW) / 60 ))
+              echo "[${{ matrix.bot.name }}] Session alive at $(date '+%H:%M:%S') | ${ELAPSED}min elapsed | ${LEFT}min until hard limit (chained)"
+            fi
+
+            if [ -f /tmp/openclaw.log ]; then
+              tail -n 15 /tmp/openclaw.log || true
+            fi
+
+            # Tunnel check
+            if ! pgrep -x cloudflared > /dev/null 2>&1 && ! pgrep -f "localtunnel" > /dev/null 2>&1; then
+              echo "  WARNING: Tunnel process died, restarting..."
+              cloudflared tunnel --url http://localhost:${{ env.OPENCLAW_PORT }} --no-autoupdate > /tmp/tunnel.log 2>&1 &
+            fi
+
+            # Browser check
+            if ! curl -sf http://127.0.0.1:18800/json/version > /dev/null 2>&1; then
+              BROWSER_FAIL_COUNT=$((BROWSER_FAIL_COUNT + 1))
+              if [ "$BROWSER_FAIL_COUNT" -le 3 ]; then
+                export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+                export PATH="$HOME/.npm-global/bin:$PATH"
+                export OPENCLAW_GATEWAY_TOKEN="openclaw"
+                export PLAYWRIGHT_BROWSERS_PATH="$HOME/.playwright-browsers"
+                openclaw browser --browser-profile openclaw start 2>&1 || true
+              fi
+            else
+              BROWSER_FAIL_COUNT=0
+            fi
+
+            # Periodic save
+            SINCE_SAVE=$(( (NOW - LAST_SAVE) / 60 ))
+            if [ "$SINCE_SAVE" -ge "$SAVE_INTERVAL" ]; then
+              save_secrets
+              LAST_SAVE=$(date +%s)
+            fi
+
+            # Chain check
+            if [ "$CHAIN_TRIGGERED" = "false" ] && [ "$(date +%s)" -ge "$CHAIN_TIME" ]; then
+              save_secrets
+              if trigger_chain; then
+                CHAIN_TRIGGERED=true
+                echo "CHAIN_DONE=true" >> "$GITHUB_OUTPUT"
+              fi
+            fi
+
+            sleep 60
+          done
+
+          save_secrets
+          if [ "$CHAIN_TRIGGERED" = "false" ]; then
+            echo "CHAIN_DONE=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ========== CLEANUP & CHAIN (always runs) ==========
+      - name: Save secrets (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          OPENCLAW_DIR="$HOME/.openclaw"
+          CONFIG_SECRET="${{ matrix.bot.config_secret }}"
+          AUTH_SECRET="${{ matrix.bot.auth_secret }}"
+
+          CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
+          AUTH_FILE="$OPENCLAW_DIR/agents/main/agent/auth-profiles.json"
+          if [ -f "$CONFIG_FILE" ] && [ -n "$CONFIG_SECRET" ]; then
+            gh secret set "$CONFIG_SECRET" --repo "$REPO" < "$CONFIG_FILE" 2>/dev/null || true
+          fi
+          if [ -f "$AUTH_FILE" ] && [ -n "$AUTH_SECRET" ]; then
+            gh secret set "$AUTH_SECRET" --repo "$REPO" < "$AUTH_FILE" 2>/dev/null || true
+          fi
+          echo "Fallback secrets saved for ${{ matrix.bot.name }}"
+        continue-on-error: true
+
+      - name: Clean workspace before upload
+        if: always()
+        run: |
+          WORKSPACE="$HOME/.openclaw/workspace"
+          if [ ! -d "$WORKSPACE" ]; then exit 0; fi
+
+          echo "Preserving agent session history & memory state into workspace..."
+          mkdir -p "$WORKSPACE/.openclaw-state"
+          if [ -d "$HOME/.openclaw/agents" ]; then
+            mkdir -p "$WORKSPACE/.openclaw-state/agents"
+            cp -r "$HOME/.openclaw/agents/"* "$WORKSPACE/.openclaw-state/agents/" 2>/dev/null || true
+          fi
+          if [ -d "$HOME/.openclaw/memory" ]; then
+            mkdir -p "$WORKSPACE/.openclaw-state/memory"
+            cp -r "$HOME/.openclaw/memory/"* "$WORKSPACE/.openclaw-state/memory/" 2>/dev/null || true
+          fi
+
+          rm -f "$WORKSPACE/openclaw.json"
+          find "$WORKSPACE" -type f \( -name "*.bak" -o -name "*.patched" -o -name "fix-*.mjs" \) -delete 2>/dev/null || true
+          find "$WORKSPACE" -type d \( -name "node_modules" -o -name "__pycache__" -o -name ".venv" -o -name "venv" -o -name ".cache" -o -name "tmp" \) -exec rm -rf {} + 2>/dev/null || true
+
+          MAX_MB=400
+          CURRENT_KB=$(du -sk "$WORKSPACE" 2>/dev/null | cut -f1)
+          CURRENT_MB=$((CURRENT_KB / 1024))
+
+          if [ "$CURRENT_MB" -gt "$MAX_MB" ]; then
+            while [ "$CURRENT_MB" -gt "$MAX_MB" ]; do
+              LARGEST=$(find "$WORKSPACE" -type f -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)
+              if [ -z "$LARGEST" ]; then break; fi
+              rm -f "$(echo "$LARGEST" | cut -d' ' -f2-)"
+              CURRENT_KB=$(du -sk "$WORKSPACE" 2>/dev/null | cut -f1)
+              CURRENT_MB=$((CURRENT_KB / 1024))
+            done
+          fi
+
+      - name: Upload workspace artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.bot.artifact_name }}
+          path: /home/runner/.openclaw/workspace
+          retention-days: 90
+          if-no-files-found: ignore
+          overwrite: true
+
+      - name: Trigger next session (fallback)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          CHAIN_DONE="${{ steps.keepalive.outputs.CHAIN_DONE }}"
+          if [ "$CHAIN_DONE" = "true" ]; then exit 0; fi
+
+          SESSION_ID="${{ steps.session.outputs.SESSION_ID }}"
+          NEXT_CHAIN=$(( ${{ steps.session.outputs.CHAIN_COUNT }} + 1 ))
+          OPENCLAW_CACHE_VERSION="${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}"
+          REPO="${{ github.repository }}"
+
+          BODY=$(jq -n \
+            --arg event_type "chain-openclaw-parallel" \
+            --arg session_id "$SESSION_ID" \
+            --argjson chain_count "$NEXT_CHAIN" \
+            --arg cache_version "$OPENCLAW_CACHE_VERSION" \
+            '{event_type: $event_type, client_payload: {session_id: $session_id, chain_count: $chain_count, openclaw_cache_version: $cache_version}}')
+
+          for i in 1 2 3; do
+            echo "$BODY" | gh api "repos/$REPO/dispatches" --method POST --input - && exit 0
+            [ "$i" -lt 3 ] && sleep 15
+          done
+
+      - name: Save npm global packages cache
+        if: ${{ always() && steps.cache-npm-global.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.npm-global
+          key: npm-global-openclaw-${{ steps.session.outputs.OPENCLAW_CACHE_VERSION }}-${{ runner.os }}
+        continue-on-error: true
+
+      - name: Save CloakBrowser cache
+        if: ${{ always() && steps.cache-cloakbrowser.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cloakbrowser
+            ~/.cache/cloakbrowser-node
+            ~/.npm
+          key: cloakbrowser-v4-${{ runner.os }}
+        continue-on-error: true

@@ -253,11 +253,13 @@ jobs:
           done
 
           ARTIFACT_NAME="${{ matrix.bot.artifact_name }}"
-          ARTIFACT_INFO=$(gh api "repos/$REPO/actions/artifacts" --jq "[.artifacts[] | select(.name == \"$ARTIFACT_NAME\" and .expired == false)] | first | \"\(.id) \(.workflow_run.id)\"" 2>/dev/null || echo "")
+          CURRENT_RUN_ID="${{ github.run_id }}"
+          ARTIFACT_INFO=$(gh api "repos/$REPO/actions/artifacts?per_page=100" --jq "[.artifacts[] | select(.name == \"$ARTIFACT_NAME\" and .expired == false and (.workflow_run.id != $CURRENT_RUN_ID))] | sort_by(.created_at) | reverse | first | \"\(.id) \(.workflow_run.id)\"" 2>/dev/null || echo "")
 
-          if [ -n "$ARTIFACT_INFO" ] && [ "$ARTIFACT_INFO" != "null null" ]; then
+          if [ -n "$ARTIFACT_INFO" ] && [ "$ARTIFACT_INFO" != "null null" ] && [ "$ARTIFACT_INFO" != "" ]; then
             RUN_ID=$(echo "$ARTIFACT_INFO" | awk '{print $2}')
-            echo "Found workspace artifact ($ARTIFACT_NAME) from run: $RUN_ID"
+            ARTIFACT_ID=$(echo "$ARTIFACT_INFO" | awk '{print $1}')
+            echo "Found workspace artifact ($ARTIFACT_NAME, ID: $ARTIFACT_ID) from run: $RUN_ID"
             echo "RUN_ID=$RUN_ID" >> "$GITHUB_OUTPUT"
             echo "FOUND=true" >> "$GITHUB_OUTPUT"
           else
@@ -272,28 +274,36 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           RUN_ID="${{ steps.find-artifact.outputs.RUN_ID }}"
-          WORKSPACE="$HOME/.openclaw/workspace"
+          OPENCLAW_DIR="$HOME/.openclaw"
+          WORKSPACE="$OPENCLAW_DIR/workspace"
           ARTIFACT_NAME="${{ matrix.bot.artifact_name }}"
+          RESTORE_TMP="/tmp/restore-artifact"
 
+          mkdir -p "$RESTORE_TMP"
           mkdir -p "$WORKSPACE"
+
           echo "Downloading $ARTIFACT_NAME from run $RUN_ID..."
-          gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$WORKSPACE"
+          gh run download "$RUN_ID" --repo "$REPO" --name "$ARTIFACT_NAME" --dir "$RESTORE_TMP" 2>&1 || true
 
-          if [ -n "$(find "$WORKSPACE" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
-            echo "Workspace artifact restored into $WORKSPACE"
-
+          if [ -f "$RESTORE_TMP/openclaw-backup.tar.gz" ]; then
+            echo "Extracting complete OpenClaw state (workspace + agents + memory)..."
+            tar -xzf "$RESTORE_TMP/openclaw-backup.tar.gz" -C "$OPENCLAW_DIR"
+            echo "Complete OpenClaw state restored from tarball"
+          elif [ -n "$(find "$RESTORE_TMP" -mindepth 1 -maxdepth 1 2>/dev/null)" ]; then
+            echo "Restoring legacy workspace files..."
+            cp -r "$RESTORE_TMP/"* "$WORKSPACE/" 2>/dev/null || true
             if [ -d "$WORKSPACE/.openclaw-state/agents" ]; then
-              echo "Restoring persistent agent session history & memory state..."
-              mkdir -p "$HOME/.openclaw/agents"
-              cp -r "$WORKSPACE/.openclaw-state/agents/"* "$HOME/.openclaw/agents/" 2>/dev/null || true
+              mkdir -p "$OPENCLAW_DIR/agents"
+              cp -r "$WORKSPACE/.openclaw-state/agents/"* "$OPENCLAW_DIR/agents/" 2>/dev/null || true
             fi
             if [ -d "$WORKSPACE/.openclaw-state/memory" ]; then
-              mkdir -p "$HOME/.openclaw/memory"
-              cp -r "$WORKSPACE/.openclaw-state/memory/"* "$HOME/.openclaw/memory/" 2>/dev/null || true
+              mkdir -p "$OPENCLAW_DIR/memory"
+              cp -r "$WORKSPACE/.openclaw-state/memory/"* "$OPENCLAW_DIR/memory/" 2>/dev/null || true
             fi
-          else
-            echo "WARNING: Workspace artifact download completed, but workspace is empty"
           fi
+
+          rm -rf "$RESTORE_TMP"
+          echo "Workspace restored: $(find "$WORKSPACE" -type f 2>/dev/null | wc -l) files"
 
       - name: Fix OpenClaw directory permissions
         run: |
@@ -646,31 +656,25 @@ jobs:
           echo "Fallback secrets saved for ${{ matrix.bot.name }}"
         continue-on-error: true
 
-      - name: Clean workspace before upload
+      - name: Package OpenClaw state & workspace
         if: always()
         run: |
-          WORKSPACE="$HOME/.openclaw/workspace"
-          if [ ! -d "$WORKSPACE" ]; then exit 0; fi
+          OPENCLAW_DIR="$HOME/.openclaw"
+          WORKSPACE="$OPENCLAW_DIR/workspace"
+          BUNDLE_DIR="/tmp/openclaw-upload-bundle"
 
-          echo "Preserving agent session history & memory state into workspace..."
-          mkdir -p "$WORKSPACE/.openclaw-state"
-          if [ -d "$HOME/.openclaw/agents" ]; then
-            mkdir -p "$WORKSPACE/.openclaw-state/agents"
-            cp -r "$HOME/.openclaw/agents/"* "$WORKSPACE/.openclaw-state/agents/" 2>/dev/null || true
-          fi
-          if [ -d "$HOME/.openclaw/memory" ]; then
-            mkdir -p "$WORKSPACE/.openclaw-state/memory"
-            cp -r "$HOME/.openclaw/memory/"* "$WORKSPACE/.openclaw-state/memory/" 2>/dev/null || true
-          fi
+          mkdir -p "$WORKSPACE"
+          mkdir -p "$BUNDLE_DIR"
 
+          # Remove sensitive config or transient cache
           rm -f "$WORKSPACE/openclaw.json"
           find "$WORKSPACE" -type f \( -name "*.bak" -o -name "*.patched" -o -name "fix-*.mjs" \) -delete 2>/dev/null || true
           find "$WORKSPACE" -type d \( -name "node_modules" -o -name "__pycache__" -o -name ".venv" -o -name "venv" -o -name ".cache" -o -name "tmp" \) -exec rm -rf {} + 2>/dev/null || true
 
+          # Budget check
           MAX_MB=400
           CURRENT_KB=$(du -sk "$WORKSPACE" 2>/dev/null | cut -f1)
           CURRENT_MB=$((CURRENT_KB / 1024))
-
           if [ "$CURRENT_MB" -gt "$MAX_MB" ]; then
             while [ "$CURRENT_MB" -gt "$MAX_MB" ]; do
               LARGEST=$(find "$WORKSPACE" -type f -printf '%s %p\n' 2>/dev/null | sort -rn | head -1)
@@ -681,12 +685,19 @@ jobs:
             done
           fi
 
+          # Create compressed backup of workspace, agents history, and memory
+          echo "Packaging openclaw-backup.tar.gz (workspace + agents + memory)..."
+          tar -czf "$BUNDLE_DIR/openclaw-backup.tar.gz" -C "$OPENCLAW_DIR" workspace agents memory 2>/dev/null || \
+          tar -czf "$BUNDLE_DIR/openclaw-backup.tar.gz" -C "$OPENCLAW_DIR" workspace
+
+          echo "Bundle created successfully: $(du -sh "$BUNDLE_DIR/openclaw-backup.tar.gz" | cut -f1)"
+
       - name: Upload workspace artifact
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.bot.artifact_name }}
-          path: /home/runner/.openclaw/workspace
+          path: /tmp/openclaw-upload-bundle
           retention-days: 90
           if-no-files-found: ignore
           overwrite: true

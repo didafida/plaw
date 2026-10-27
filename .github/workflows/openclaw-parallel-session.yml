@@ -86,7 +86,7 @@ jobs:
           fi
 
           if [ -z "$OPENCLAW_CACHE_VERSION" ]; then
-            OPENCLAW_CACHE_VERSION="v1"
+            OPENCLAW_CACHE_VERSION="v2"
           fi
 
           JOB_START=$(date +%s)
@@ -100,7 +100,8 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: '26'
+          check-latest: true
 
       # ========== CACHING ==========
       - name: Restore npm global packages cache
